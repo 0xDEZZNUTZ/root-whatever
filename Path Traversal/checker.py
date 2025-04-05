@@ -65,6 +65,7 @@ class PathTraversalScanner:
         self.found_vulnerabilities = set()
         self.session = requests.Session()
         self.session.verify = not args.insecure
+        self.ignore_404 = args.ignore_404
         
         # Set up HTTP headers
         self.headers = {
@@ -98,6 +99,45 @@ class PathTraversalScanner:
                 name, value = cookie.strip().split('=', 1)
                 cookies[name] = value
         return cookies
+    
+    def validate_target_url(self) -> bool:
+        """
+        Validate that the target URL is accessible before starting the scan.
+        Returns True if the URL is valid and accessible, False otherwise.
+        """
+        try:
+            if self.verbose:
+                logger.info(f"Validating target URL: {self.target_url}")
+                
+            response = self.session.get(
+                self.target_url,
+                headers=self.headers,
+                timeout=self.timeout,
+                allow_redirects=True
+            )
+            
+            # Check if the response is 404 or another error
+            if response.status_code == 404:
+                logger.error(f"[bold red]Target URL returns 404 Not Found: {self.target_url}[/bold red]")
+                if not self.ignore_404:
+                    logger.error("[bold yellow]Use --ignore-404 flag to scan anyway[/bold yellow]")
+                    return False
+                else:
+                    logger.warning("[bold yellow]Proceeding with scan despite 404 (--ignore-404 flag is set)[/bold yellow]")
+                    return True
+            elif response.status_code >= 400:
+                logger.warning(f"[bold yellow]Target URL returned status code {response.status_code}: {self.target_url}[/bold yellow]")
+                if self.verbose:
+                    logger.warning(f"Response preview: {response.text[:200]}")
+                return True  # Still return True to continue with scan
+            
+            if self.verbose:
+                logger.info(f"Target URL validation successful (status code: {response.status_code})")
+            return True
+            
+        except RequestException as e:
+            logger.error(f"[bold red]Could not connect to target URL: {str(e)}[/bold red]")
+            return False
     
     def generate_traversal_payloads(self, file_path: str) -> List[Tuple[str, int, str]]:
         """Generate different traversal payloads for testing"""
@@ -199,6 +239,22 @@ class PathTraversalScanner:
                     result = future.result()
                     if result:
                         results.append(result)
+                        
+                        # Display vulnerability as soon as it's found with simpler formatting
+                        self.found_vulnerabilities.add(result.url)
+                        console.print("\n[VULNERABLE] URL: " + result.url)
+                        console.print("File: " + result.file_path)
+                        console.print(f"Depth: {result.traversal_depth}, Encoding: {result.encoding_type}")
+                        console.print(f"Status: {result.status_code}, Length: {result.content_length}")
+                        console.print(f"Content: {result.content_preview[:100]}")
+                        
+                        # Check if it's downloadable content
+                        if self.detect_downloadable_content(result):
+                            console.print(f"WARNING: Potential downloadable file detected")
+                            console.print(f"Download with: curl -o output_file '{result.url}'")
+                        
+                        console.print("-" * 60)
+                        
                 except Exception as e:
                     if self.verbose:
                         logger.error(f"Error testing payload {payload}: {str(e)}")
@@ -207,15 +263,24 @@ class PathTraversalScanner:
     
     def scan(self, file_paths: List[str]) -> List[PathTraversalResult]:
         """Scan multiple files for path traversal vulnerabilities"""
+        # First validate the target URL
+        if not self.validate_target_url():
+            logger.error("Target URL validation failed. Aborting scan.")
+            return []
+            
         all_results = []
+        
+        console.print("\nStarting path traversal scan")
+        console.print(f"Target URL: {self.target_url}")
+        console.print("Discovered vulnerabilities")
         
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
+            TextColumn("{task.description}"),
             TimeElapsedColumn(),
             console=console
         ) as progress:
-            task = progress.add_task("[bold blue]Scanning for path traversal vulnerabilities...", total=len(file_paths))
+            task = progress.add_task("Scanning for path traversal vulnerabilities...", total=len(file_paths))
             
             for file_path in file_paths:
                 if self.verbose:
@@ -224,14 +289,10 @@ class PathTraversalScanner:
                 results = self.scan_file(file_path)
                 all_results.extend(results)
                 
-                if results:
-                    for result in results:
-                        self.found_vulnerabilities.add(result.url)
-                        logger.info(f"[bold green]Found vulnerable endpoint:[/bold green] {result.url}")
-                
                 progress.update(task, advance=1)
         
         return all_results
+    
     def detect_downloadable_content(self, result: PathTraversalResult) -> bool:
         """
         Detect if the response likely contains binary or downloadable content
@@ -312,23 +373,29 @@ class PathTraversalScanner:
     
     def print_summary(self, results: List[PathTraversalResult]) -> None:
         """Print a summary of the scan results"""
-        console.print("\n[bold]Scan Summary[/bold]")
+        console.print("\nScan Summary")
         console.print(f"Target URL: {self.target_url}")
         console.print(f"Total potential vulnerabilities found: {len(results)}")
         
-        if self.detect_downloadable_content(result):
-            console.print(f"[bold yellow]⚠️  WARNING: Potential downloadable file detected at {result.url}[/bold yellow]")
-            console.print(f"[bold yellow]   This file may need to be downloaded with: curl -o output_file '{result.url}'[/bold yellow]")
-        
         if results:
-            console.print("\n[bold green]Vulnerable Endpoints:[/bold green]")
+            console.print("\nVulnerable Endpoints:")
             for result in results:
                 console.print(f"  - {result.url}")
-                console.print(f"    [dim]Status: {result.status_code}, File: {result.file_path}, Depth: {result.traversal_depth}, Encoding: {result.encoding_type}[/dim]")
+                console.print(f"    Status: {result.status_code}, File: {result.file_path}")
+                console.print(f"    Depth: {result.traversal_depth}, Encoding: {result.encoding_type}")
+                
+                if self.detect_downloadable_content(result):
+                    console.print(f"    WARNING: Potential downloadable file detected")
+                    console.print(f"    Download with: curl -o output_file '{result.url}'")
         else:
-            console.print("\n[bold yellow]No vulnerabilities found with the current configuration.[/bold yellow]")
+            console.print("\nNo vulnerabilities found with the current configuration.")
+            console.print("Possible next steps:")
+            console.print("  - Try different target files (use --files option)")
+            console.print("  - Increase traversal depth (use -d option)")
+            console.print("  - Try different parameter names if unsure")
+            console.print("  - The target may not be vulnerable or may be using different paths")
         
-        console.print("\n[bold]Recommendations:[/bold]")
+        console.print("\nRecommendations:")
         console.print("  - Validate and sanitize all user inputs")
         console.print("  - Implement proper access controls and file permissions")
         console.print("  - Consider using a web application firewall (WAF)")
@@ -352,19 +419,19 @@ def main():
     parser.add_argument("--cookies", help="Cookies to include with requests (format: name1=value1; name2=value2)")
     parser.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification")
     parser.add_argument("--files", help="Comma-separated list of files to test")
+    parser.add_argument("--ignore-404", action="store_true", help="Continue scanning even if the target URL returns 404")
     
     args = parser.parse_args()
     
 
 
-    console.print("[bold blue]                                                            [/bold blue]")
-    console.print("[bold blue]   ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗███████╗██████╗   [/bold blue]")
-    console.print("[bold blue]  ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝██╔════╝██╔══██╗  [/bold blue]")
-    console.print("[bold blue]  ██║     ███████║█████╗  ██║     █████╔╝ █████╗  ██████╔╝  [/bold blue]")
-    console.print("[bold blue]  ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ ██╔══╝  ██╔══██╗  [/bold blue]")
-    console.print("[bold blue]  ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗███████╗██║  ██║  [/bold blue]")
-    console.print("[bold blue]   ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝  [/bold blue]")
-    console.print("[bold blue]                                                            [/bold blue]")
+    console.print("   ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗███████╗██████╗  ")
+    console.print("  ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝██╔════╝██╔══██╗ ")
+    console.print("  ██║     ███████║█████╗  ██║     █████╔╝ █████╗  ██████╔╝ ")
+    console.print("  ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ ██╔══╝  ██╔══██╗ ")
+    console.print("  ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗███████╗██║  ██║ ")
+    console.print("   ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ")
+    console.print("                                                           ")
     
 
     default_files = [
